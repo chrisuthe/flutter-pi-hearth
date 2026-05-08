@@ -1,0 +1,11 @@
+upstream:    https://github.com/ardera/flutter-pi.git
+upstream_sha: f0b333052f4e71e51f9049e5016082357175057a
+upstream_subject: don't enforce rotation
+pinned_at:   2026-05-08
+notes:
+  - This fork carries Hearth-specific patches on the `hearth` branch.
+  - Rebase onto a newer upstream by: git remote add upstream <url>;
+    git fetch upstream; git rebase upstream/master; resolve; update
+    this file; force-push the `hearth` branch.
+  - Patches are in commits, not as text-replacement scripts.
+  - DO NOT delete this file or the rebase tracking gets harder.
