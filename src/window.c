@@ -1274,7 +1274,7 @@ static void on_present_frame(void *userdata) {
         int mok = kms_req_commit_blocking(frame->mirror_req, NULL);
         TRACER_END(frame->tracer, "kms_req_commit_blocking_mirror");
         if (mok != 0) {
-            LOG_ERROR("Mirror commit failed; mirror will be disabled going forward. errno=%d\n", mok);
+            LOG_ERROR("Mirror commit failed for this frame; will retry next frame. errno=%d\n", mok);
             // We can't disable window->mirror.enabled from here without the window pointer;
             // the next frame will retry. If it keeps failing, the mirror just won't
             // show — kiosk on primary continues normally.
