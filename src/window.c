@@ -1341,13 +1341,38 @@ static int kms_window_build_req_for_target(
         }
     }
 
+    // For mirror targets running at a different mode, compute a letterboxed
+    // dst rect so DRM's HVS plane-scales the framebuffer in hardware.
+    struct surface_present_kms_dst mirror_dst;
+    struct surface_present_kms_opts mirror_opts = { .dst_override = NULL };
+
+    if (target->is_mirror) {
+        int mw = (int) target->mode->hdisplay;
+        int mh = (int) target->mode->vdisplay;
+        int sw = (int) window->display_size.x;
+        int sh = (int) window->display_size.y;
+
+        double sx = (double) mw / (double) sw;
+        double sy = (double) mh / (double) sh;
+        double s = sx < sy ? sx : sy;
+        int dw = (int) (sw * s);
+        int dh = (int) (sh * s);
+        mirror_dst.x = (mw - dw) / 2;
+        mirror_dst.y = (mh - dh) / 2;
+        mirror_dst.w = dw;
+        mirror_dst.h = dh;
+        mirror_opts.dst_override = &mirror_dst;
+    }
+
     for (size_t i = 0; i < fl_layer_composition_get_n_layers(composition); i++) {
         struct fl_layer *layer = fl_layer_composition_peek_layer(composition, i);
 
-        // Approach A: pass identical layer props to both targets.
-        // Mirror at a different mode will be clipped/positioned at 0,0 —
-        // proper plane-rect scaling lands in a follow-up commit.
-        ok = surface_present_kms(layer->surface, &layer->props, builder);
+        ok = surface_present_kms(
+            layer->surface,
+            &layer->props,
+            builder,
+            target->is_mirror ? &mirror_opts : NULL
+        );
         if (ok != 0) {
             LOG_ERROR(
                 "Couldn't present layer on %s. surface_present_kms: %s\n",

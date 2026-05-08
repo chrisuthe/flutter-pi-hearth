@@ -100,7 +100,7 @@ ATTR_PURE struct egl_gbm_render_surface *__checked_cast_egl_gbm_render_surface(v
 #endif
 
 void egl_gbm_render_surface_deinit(struct surface *s);
-static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
+static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts);
 static int
 egl_gbm_render_surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
 static int egl_gbm_render_surface_fill(struct render_surface *s, FlutterBackingStore *fl_store);
@@ -380,7 +380,7 @@ static void on_release_layer(void *userdata) {
     locked_fb_unref(fb);
 }
 
-static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts) {
     struct egl_gbm_render_surface *egl_surface;
     struct gbm_bo_meta *meta;
     struct drmdev *drmdev;
@@ -514,36 +514,43 @@ static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl
         }
     }
 
+    struct kms_fb_layer layer = {
+        .drm_fb_id = fb_id,
+        .format = pixel_format,
+        .has_modifier = gbm_bo_get_modifier(bo) != DRM_FORMAT_MOD_INVALID,
+        .modifier = gbm_bo_get_modifier(bo),
+
+        .dst_x = (int32_t) props->aa_rect.offset.x,
+        .dst_y = (int32_t) props->aa_rect.offset.y,
+        .dst_w = (uint32_t) props->aa_rect.size.x,
+        .dst_h = (uint32_t) props->aa_rect.size.y,
+
+        .src_x = 0,
+        .src_y = 0,
+        .src_w = DOUBLE_TO_FP1616_ROUNDED(egl_surface->render_surface.size.x),
+        .src_h = DOUBLE_TO_FP1616_ROUNDED(egl_surface->render_surface.size.y),
+
+        // If a rotated framebuffer console is shown, the rotation of the primary plane might be non-zero.
+        //
+        // Even though it'd be nice to keep using the already set rotation, other planes might not be rotated,
+        // so just use zero rotation for all planes.
+        .has_rotation = true,
+        .rotation = PLANE_TRANSFORM_ROTATE_0,
+        .enforce_rotation = false,
+
+        .has_in_fence_fd = false,
+        .in_fence_fd = 0,
+    };
+    if (opts != NULL && opts->dst_override != NULL) {
+        layer.dst_x = opts->dst_override->x;
+        layer.dst_y = opts->dst_override->y;
+        layer.dst_w = opts->dst_override->w;
+        layer.dst_h = opts->dst_override->h;
+    }
     TRACER_BEGIN(egl_surface->surface.tracer, "kms_req_builder_push_fb_layer");
     ok = kms_req_builder_push_fb_layer(
         builder,
-        &(const struct kms_fb_layer){
-            .drm_fb_id = fb_id,
-            .format = pixel_format,
-            .has_modifier = gbm_bo_get_modifier(bo) != DRM_FORMAT_MOD_INVALID,
-            .modifier = gbm_bo_get_modifier(bo),
-
-            .dst_x = (int32_t) props->aa_rect.offset.x,
-            .dst_y = (int32_t) props->aa_rect.offset.y,
-            .dst_w = (uint32_t) props->aa_rect.size.x,
-            .dst_h = (uint32_t) props->aa_rect.size.y,
-
-            .src_x = 0,
-            .src_y = 0,
-            .src_w = DOUBLE_TO_FP1616_ROUNDED(egl_surface->render_surface.size.x),
-            .src_h = DOUBLE_TO_FP1616_ROUNDED(egl_surface->render_surface.size.y),
-
-            // If a rotated framebuffer console is shown, the rotation of the primary plane might be non-zero.
-            //
-            // Even though it'd be nice to keep using the already set rotation, other planes might not be rotated,
-            // so just use zero rotation for all planes.
-            .has_rotation = true,
-            .rotation = PLANE_TRANSFORM_ROTATE_0,
-            .enforce_rotation = false,
-
-            .has_in_fence_fd = false,
-            .in_fence_fd = 0,
-        },
+        &layer,
         on_release_layer,
         NULL,
         locked_fb_ref(egl_surface->locked_front_fb),

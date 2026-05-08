@@ -105,7 +105,7 @@ ATTR_PURE struct dmabuf_surface *__checked_cast_dmabuf_surface(void *ptr) {
 #endif
 
 static void dmabuf_surface_deinit(struct surface *s);
-static int dmabuf_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
+static int dmabuf_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts);
 static int dmabuf_surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
 
 int dmabuf_surface_init(struct dmabuf_surface *s, struct tracer *tracer, struct texture_registry *texture_registry) {
@@ -246,7 +246,7 @@ ATTR_PURE int64_t dmabuf_surface_get_texture_id(struct dmabuf_surface *s) {
     return texture_get_id(s->texture);
 }
 
-static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts) {
     struct dmabuf_surface *s;
     uint32_t fb_id;
     int ok;
@@ -284,32 +284,39 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
         s->next_buf->drmdev = drmdev_ref(kms_req_builder_get_drmdev(builder));
     }
 
+    struct kms_fb_layer layer = {
+        .drm_fb_id = fb_id,
+        .format = s->next_buf->buf.format,
+
+        .has_modifier = s->next_buf->buf.has_modifiers,
+        .modifier = s->next_buf->buf.modifiers[0],
+
+        .src_x = 0,
+        .src_y = 0,
+        .src_w = DOUBLE_TO_FP1616_ROUNDED(s->next_buf->buf.width),
+        .src_h = DOUBLE_TO_FP1616_ROUNDED(s->next_buf->buf.height),
+
+        .dst_x = props->aa_rect.offset.x,
+        .dst_y = props->aa_rect.offset.y,
+        .dst_w = props->aa_rect.size.x,
+        .dst_h = props->aa_rect.size.y,
+
+        .has_rotation = false,
+        .rotation = PLANE_TRANSFORM_ROTATE_0,
+        .enforce_rotation = false,
+
+        .has_in_fence_fd = false,
+        .in_fence_fd = 0,
+    };
+    if (opts != NULL && opts->dst_override != NULL) {
+        layer.dst_x = opts->dst_override->x;
+        layer.dst_y = opts->dst_override->y;
+        layer.dst_w = opts->dst_override->w;
+        layer.dst_h = opts->dst_override->h;
+    }
     ok = kms_req_builder_push_fb_layer(
         builder,
-        &(struct kms_fb_layer){
-            .drm_fb_id = fb_id,
-            .format = s->next_buf->buf.format,
-
-            .has_modifier = s->next_buf->buf.has_modifiers,
-            .modifier = s->next_buf->buf.modifiers[0],
-
-            .src_x = 0,
-            .src_y = 0,
-            .src_w = DOUBLE_TO_FP1616_ROUNDED(s->next_buf->buf.width),
-            .src_h = DOUBLE_TO_FP1616_ROUNDED(s->next_buf->buf.height),
-
-            .dst_x = props->aa_rect.offset.x,
-            .dst_y = props->aa_rect.offset.y,
-            .dst_w = props->aa_rect.size.x,
-            .dst_h = props->aa_rect.size.y,
-
-            .has_rotation = false,
-            .rotation = PLANE_TRANSFORM_ROTATE_0,
-            .enforce_rotation = false,
-
-            .has_in_fence_fd = false,
-            .in_fence_fd = 0,
-        },
+        &layer,
         refcounted_dmabuf_unref_void,
         NULL,
         refcounted_dmabuf_ref(s->next_buf),

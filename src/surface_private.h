@@ -22,6 +22,7 @@ struct fl_layer_props;
 struct kms_req_builder;
 struct fbdev_commit_builder;
 struct tracer;
+struct surface_present_kms_opts;
 
 struct surface {
 #ifdef DEBUG
@@ -32,7 +33,7 @@ struct surface {
     struct tracer *tracer;
     int64_t revision;
 
-    int (*present_kms)(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
+    int (*present_kms)(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts);
     int (*present_fbdev)(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
     void (*deinit)(struct surface *s);
 };

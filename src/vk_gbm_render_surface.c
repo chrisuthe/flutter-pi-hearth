@@ -171,7 +171,7 @@ ATTR_PURE struct vk_gbm_render_surface *__checked_cast_vk_gbm_render_surface(voi
 #endif
 
 void vk_gbm_render_surface_deinit(struct surface *s);
-static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
+static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts);
 static int vk_gbm_render_surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
 static int vk_gbm_render_surface_fill(struct render_surface *surface, FlutterBackingStore *fl_store);
 static int vk_gbm_render_surface_queue_present(struct render_surface *surface, const FlutterBackingStore *fl_store);
@@ -577,7 +577,7 @@ static void on_release_layer(void *userdata) {
     surface_unref(CAST_SURFACE_UNCHECKED(surface));
 }
 
-static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts) {
     struct vk_gbm_render_surface *vk_surface;
     struct gbm_bo_meta *meta;
     struct drmdev *drmdev;
@@ -668,33 +668,40 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
 
     vkDeviceWaitIdle(vk_renderer_get_device(vk_surface->renderer));
 
+    struct kms_fb_layer layer = {
+        .drm_fb_id = fb_id,
+        .format = pixel_format,
+        .has_modifier = true,
+        .modifier = gbm_bo_get_modifier(bo),
+
+        .dst_x = (int32_t) props->aa_rect.offset.x,
+        .dst_y = (int32_t) props->aa_rect.offset.y,
+        .dst_w = (uint32_t) props->aa_rect.size.x,
+        .dst_h = (uint32_t) props->aa_rect.size.y,
+
+        .src_x = 0,
+        .src_y = 0,
+        .src_w = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.x),
+        .src_h = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.y),
+
+        // see egl_gbm_render_surface_present_kms
+        .has_rotation = true,
+        .rotation = PLANE_TRANSFORM_ROTATE_0,
+        .enforce_rotation = false,
+
+        .has_in_fence_fd = false,
+        .in_fence_fd = 0,
+    };
+    if (opts != NULL && opts->dst_override != NULL) {
+        layer.dst_x = opts->dst_override->x;
+        layer.dst_y = opts->dst_override->y;
+        layer.dst_w = opts->dst_override->w;
+        layer.dst_h = opts->dst_override->h;
+    }
     TRACER_BEGIN(vk_surface->surface.tracer, "kms_req_builder_push_fb_layer");
     ok = kms_req_builder_push_fb_layer(
         builder,
-        &(const struct kms_fb_layer){
-            .drm_fb_id = fb_id,
-            .format = pixel_format,
-            .has_modifier = true,
-            .modifier = gbm_bo_get_modifier(bo),
-
-            .dst_x = (int32_t) props->aa_rect.offset.x,
-            .dst_y = (int32_t) props->aa_rect.offset.y,
-            .dst_w = (uint32_t) props->aa_rect.size.x,
-            .dst_h = (uint32_t) props->aa_rect.size.y,
-
-            .src_x = 0,
-            .src_y = 0,
-            .src_w = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.x),
-            .src_h = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.y),
-
-            // see egl_gbm_render_surface_present_kms
-            .has_rotation = true,
-            .rotation = PLANE_TRANSFORM_ROTATE_0,
-            .enforce_rotation = false,
-
-            .has_in_fence_fd = false,
-            .in_fence_fd = 0,
-        },
+        &layer,
         on_release_layer,
         NULL,
         locked_fb_ref(vk_surface->front_fb),

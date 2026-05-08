@@ -56,7 +56,7 @@ ATTR_PURE struct dummy_render_surface *__checked_cast_dummy_render_surface(void 
 #endif
 
 void dummy_render_surface_deinit(struct surface *s);
-static int dummy_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
+static int dummy_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts);
 static int dummy_render_surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
 static int dummy_render_surface_fill(struct render_surface *surface, FlutterBackingStore *fl_store);
 static int dummy_render_surface_queue_present(struct render_surface *surface, const FlutterBackingStore *fl_store);
@@ -109,9 +109,10 @@ void dummy_render_surface_deinit(struct surface *s) {
 }
 
 static int
-dummy_render_surface_present_kms(struct surface *s, UNUSED const struct fl_layer_props *props, UNUSED struct kms_req_builder *builder) {
+dummy_render_surface_present_kms(struct surface *s, UNUSED const struct fl_layer_props *props, UNUSED struct kms_req_builder *builder, UNUSED const struct surface_present_kms_opts *opts) {
     (void) props;
     (void) builder;
+    (void) opts;
 
     TRACER_INSTANT(s->tracer, "dummy_render_surface_present_kms");
 

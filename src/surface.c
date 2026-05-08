@@ -87,7 +87,7 @@ int64_t surface_get_revision(struct surface *s) {
     return s->revision;
 }
 
-int surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+int surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts) {
     int ok;
 
     ASSERT_NOT_NULL(s);
@@ -96,7 +96,7 @@ int surface_present_kms(struct surface *s, const struct fl_layer_props *props, s
     ASSERT_NOT_NULL(s->present_kms);
 
     TRACER_BEGIN(s->tracer, "surface_present_kms");
-    ok = s->present_kms(s, props, builder);
+    ok = s->present_kms(s, props, builder, opts);
     TRACER_END(s->tracer, "surface_present_kms");
 
     return ok;

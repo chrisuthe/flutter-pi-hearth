@@ -40,7 +40,22 @@ ATTR_PURE static inline struct surface *surface_from_id(int64_t id) {
 
 ATTR_PURE int64_t surface_get_revision(struct surface *s);
 
-int surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
+struct surface_present_kms_dst {
+    int x;
+    int y;
+    int w;
+    int h;
+};
+
+struct surface_present_kms_opts {
+    /// If non-NULL, override the destination rect on the KMS plane
+    /// (i.e. plane-scale the FB to these dimensions on the target CRTC).
+    /// Used by mirror outputs running at a different mode than the
+    /// primary. Coordinates are in target-CRTC pixel space.
+    const struct surface_present_kms_dst *dst_override;
+};
+
+int surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder, const struct surface_present_kms_opts *opts);
 
 int surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
 
