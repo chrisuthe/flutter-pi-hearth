@@ -128,6 +128,19 @@ void frame_scheduler_present_frame(struct frame_scheduler *scheduler, void_callb
     present_cb(userdata);
 }
 
+void frame_scheduler_present_frame_tandem(
+    struct frame_scheduler *scheduler,
+    void_callback_t present_cb,
+    void *userdata,
+    void_callback_t cancel_cb
+) {
+    // v1: tandem == single-present; the on_present callback commits both
+    // primary and mirror reqs sequentially. This works because each kms_req
+    // holds its own FB refs until commit completes, so buffer lifetime is
+    // safe even if the two flips don't land in the same vblank.
+    frame_scheduler_present_frame(scheduler, present_cb, userdata, cancel_cb);
+}
+
 void frame_scheduler_on_scanout(struct frame_scheduler *scheduler, bool has_timestamp, uint64_t timestamp_ns) {
     ASSERT_NOT_NULL(scheduler);
     assert(!has_timestamp || timestamp_ns != 0);

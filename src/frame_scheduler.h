@@ -80,4 +80,22 @@ void frame_scheduler_on_fb_released(struct frame_scheduler *scheduler, bool has_
  */
 void frame_scheduler_present_frame(struct frame_scheduler *scheduler, void_callback_t present_cb, void *userdata, void_callback_t cancel_cb);
 
+/**
+ * @brief Same as frame_scheduler_present_frame but for tandem (mirrored)
+ * presents. v1 implementation is a thin wrapper — buffer lifetime is
+ * already safe via per-kms_req refcounts because each kms_req holds its
+ * own FB refs until commit completes.
+ *
+ * If profiling reveals tearing/skew between the two outputs, promote
+ * to a vblank-counted variant that submits both atomic commits
+ * non-blocking and gates the present-complete callback on both
+ * pageflip events.
+ */
+void frame_scheduler_present_frame_tandem(
+    struct frame_scheduler *scheduler,
+    void_callback_t present_cb,
+    void *userdata,
+    void_callback_t cancel_cb
+);
+
 #endif  // _FLUTTERPI_SRC_FRAME_SCHEDULER_H

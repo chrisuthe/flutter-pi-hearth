@@ -1240,6 +1240,8 @@ struct frame {
     struct tracer *tracer;
     struct kms_req *req;
     bool unset_should_apply_mode_on_commit;
+    struct kms_req *mirror_req;  // optional second commit for mirror output, NULL if no mirror
+    bool unset_mirror_should_apply_mode_on_commit;
 };
 
 UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *userdata) {
@@ -1267,6 +1269,20 @@ static void on_present_frame(void *userdata) {
         LOG_ERROR("Could not commit frame request.\n");
     }
 
+    if (frame->mirror_req != NULL) {
+        TRACER_BEGIN(frame->tracer, "kms_req_commit_blocking_mirror");
+        int mok = kms_req_commit_blocking(frame->mirror_req, NULL);
+        TRACER_END(frame->tracer, "kms_req_commit_blocking_mirror");
+        if (mok != 0) {
+            LOG_ERROR("Mirror commit failed; mirror will be disabled going forward. errno=%d\n", mok);
+            // We can't disable window->mirror.enabled from here without the window pointer;
+            // the next frame will retry. If it keeps failing, the mirror just won't
+            // show — kiosk on primary continues normally.
+        }
+        kms_req_unref(frame->mirror_req);
+        frame->mirror_req = NULL;
+    }
+
     tracer_unref(frame->tracer);
     kms_req_unref(frame->req);
     free(frame);
@@ -1278,71 +1294,72 @@ static void on_cancel_frame(void *userdata) {
 
     frame = userdata;
 
+    if (frame->mirror_req != NULL) {
+        kms_req_unref(frame->mirror_req);
+        frame->mirror_req = NULL;
+    }
+
     tracer_unref(frame->tracer);
     kms_req_unref(frame->req);
     free(frame);
 }
 
-static int kms_window_push_composition_locked(struct window *window, struct fl_layer_composition *composition) {
+struct mirror_present_target {
+    struct drm_crtc *crtc;
+    struct drm_connector *connector;
+    drmModeModeInfo *mode;
+    bool *should_apply_mode;  // pointer so helper can read the flag
+    bool is_mirror;
+};
+
+static int kms_window_build_req_for_target(
+    struct window *window,
+    struct fl_layer_composition *composition,
+    struct mirror_present_target *target,
+    struct kms_req **req_out
+) {
     struct kms_req_builder *builder;
-    struct kms_req *req;
-    struct frame *frame;
     int ok;
 
-    ASSERT_NOT_NULL(window);
-    ASSERT_NOT_NULL(composition);
-
-    // If flutter won't request frames (because the vsync callback is broken),
-    // we'll wait here for the previous frame to be presented / rendered.
-    // Otherwise the surface_swap_buffers at the bottom might allocate an
-    // additional buffer and we'll potentially use more buffers than we're
-    // trying to use.
-    // if (!window->use_frame_requests) {
-    //     TRACER_BEGIN(window->tracer, "window_request_frame_and_wait_for_begin");
-    //     ok = window_request_frame_and_wait_for_begin(window);
-    //     TRACER_END(window->tracer, "window_request_frame_and_wait_for_begin");
-    //     if (ok != 0) {
-    //         LOG_ERROR("Could not wait for frame begin.\n");
-    //         return ok;
-    //     }
-    // }
-
-    /// TODO: If we don't have new revisions, we don't need to scanout anything.
-    fl_layer_composition_swap_ptrs(&window->composition, composition);
-
-    builder = drmdev_create_request_builder(window->kms.drmdev, window->kms.crtc->id);
+    builder = drmdev_create_request_builder(window->kms.drmdev, target->crtc->id);
     if (builder == NULL) {
-        ok = ENOMEM;
-        goto fail_unref_builder;
+        return ENOMEM;
     }
 
     // We only set the mode once, at the first atomic request.
-    if (window->kms.should_apply_mode) {
-        ok = kms_req_builder_set_connector(builder, window->kms.connector->id);
+    if (*target->should_apply_mode) {
+        ok = kms_req_builder_set_connector(builder, target->connector->id);
         if (ok != 0) {
-            LOG_ERROR("Couldn't select connector.\n");
-            goto fail_unref_builder;
+            LOG_ERROR("Couldn't select %s connector.\n", target->is_mirror ? "mirror" : "primary");
+            goto fail;
         }
 
-        ok = kms_req_builder_set_mode(builder, window->kms.mode);
+        ok = kms_req_builder_set_mode(builder, target->mode);
         if (ok != 0) {
-            LOG_ERROR("Couldn't apply output mode.\n");
-            goto fail_unref_builder;
+            LOG_ERROR("Couldn't apply %s output mode.\n", target->is_mirror ? "mirror" : "primary");
+            goto fail;
         }
     }
 
     for (size_t i = 0; i < fl_layer_composition_get_n_layers(composition); i++) {
         struct fl_layer *layer = fl_layer_composition_peek_layer(composition, i);
 
+        // Approach A: pass identical layer props to both targets.
+        // Mirror at a different mode will be clipped/positioned at 0,0 —
+        // proper plane-rect scaling lands in a follow-up commit.
         ok = surface_present_kms(layer->surface, &layer->props, builder);
         if (ok != 0) {
-            LOG_ERROR("Couldn't present flutter layer on screen. surface_present_kms: %s\n", strerror(ok));
-            goto fail_unref_builder;
+            LOG_ERROR(
+                "Couldn't present layer on %s. surface_present_kms: %s\n",
+                target->is_mirror ? "mirror" : "primary",
+                strerror(ok)
+            );
+            goto fail;
         }
     }
 
-    // add cursor infos
-    if (window->kms.cursor != NULL) {
+    // Cursor is primary-only — skip on mirror.
+    if (!target->is_mirror && window->kms.cursor != NULL) {
         ok = kms_req_builder_push_fb_layer(
             builder,
             &(const struct kms_fb_layer){
@@ -1383,86 +1400,102 @@ static int kms_window_push_composition_locked(struct window *window, struct fl_l
         }
     }
 
-    req = kms_req_builder_build(builder);
-    if (req == NULL) {
-        goto fail_unref_builder;
+    *req_out = kms_req_builder_build(builder);
+    if (*req_out == NULL) {
+        ok = ENOMEM;
+        goto fail;
     }
 
     kms_req_builder_unref(builder);
-    builder = NULL;
+    return 0;
 
-    frame = malloc(sizeof *frame);
-    if (frame == NULL) {
-        goto fail_unref_req;
-    }
+fail:
+    kms_req_builder_unref(builder);
+    return ok;
+}
 
-    frame->req = req;
-    frame->tracer = tracer_ref(window->tracer);
-    frame->unset_should_apply_mode_on_commit = window->kms.should_apply_mode;
+static int kms_window_push_composition_locked(struct window *window, struct fl_layer_composition *composition) {
+    struct kms_req *primary_req;
+    struct kms_req *mirror_req;
+    struct frame *frame;
+    int ok;
 
-    frame_scheduler_present_frame(window->frame_scheduler, on_present_frame, frame, on_cancel_frame);
+    ASSERT_NOT_NULL(window);
+    ASSERT_NOT_NULL(composition);
 
-    // if (window->present_mode == kDoubleBufferedVsync_PresentMode) {
-    //     TRACER_BEGIN(window->tracer, "kms_req_builder_commit");
-    //     ok = kms_req_commit(req, /* blocking: */ false);
-    //     TRACER_END(window->tracer, "kms_req_builder_commit");
-    //
+    // If flutter won't request frames (because the vsync callback is broken),
+    // we'll wait here for the previous frame to be presented / rendered.
+    // Otherwise the surface_swap_buffers at the bottom might allocate an
+    // additional buffer and we'll potentially use more buffers than we're
+    // trying to use.
+    // if (!window->use_frame_requests) {
+    //     TRACER_BEGIN(window->tracer, "window_request_frame_and_wait_for_begin");
+    //     ok = window_request_frame_and_wait_for_begin(window);
+    //     TRACER_END(window->tracer, "window_request_frame_and_wait_for_begin");
     //     if (ok != 0) {
-    //         LOG_ERROR("Could not commit frame request.\n");
-    //         goto fail_unref_window2;
-    //     }
-    //
-    //     if (window->set_set_mode) {
-    //         window->set_mode = false;
-    //         window->set_set_mode = false;
-    //     }
-    // } else {
-    //     ASSERT_EQUALS(window->present_mode, kTripleBufferedVsync_PresentMode);
-    //
-    //     if (window->present_immediately) {
-    //         TRACER_BEGIN(window->tracer, "kms_req_builder_commit");
-    //         ok = kms_req_commit(req, /* blocking: */ false);
-    //         TRACER_END(window->tracer, "kms_req_builder_commit");
-    //
-    //         if (ok != 0) {
-    //             LOG_ERROR("Could not commit frame request.\n");
-    //             goto fail_unref_window2;
-    //         }
-    //
-    //         if (window->set_set_mode) {
-    //             window->set_mode = false;
-    //             window->set_set_mode = false;
-    //         }
-    //
-    //         window->present_immediately = false;
-    //     } else {
-    //         if (window->next_frame != NULL) {
-    //             /// FIXME: Call the release callbacks when the kms_req is destroyed, not when it's unrefed.
-    //             /// Not sure this here will lead to the release callbacks being called multiple times.
-    //             kms_req_call_release_callbacks(window->next_frame);
-    //             kms_req_unref(window->next_frame);
-    //         }
-    //
-    //         window->next_frame = kms_req_ref(req);
-    //         window->set_set_mode = window->set_mode;
+    //         LOG_ERROR("Could not wait for frame begin.\n");
+    //         return ok;
     //     }
     // }
 
-    // KMS Req is committed now and drmdev keeps a ref
-    // on it internally, so we don't need to keep this one.
-    // kms_req_unref(req);
+    /// TODO: If we don't have new revisions, we don't need to scanout anything.
+    fl_layer_composition_swap_ptrs(&window->composition, composition);
 
-    // window_on_rendering_complete(window);
+    primary_req = NULL;
+    mirror_req = NULL;
+
+    struct mirror_present_target primary_target = {
+        .crtc = window->kms.crtc,
+        .connector = window->kms.connector,
+        .mode = window->kms.mode,
+        .should_apply_mode = &window->kms.should_apply_mode,
+        .is_mirror = false,
+    };
+
+    ok = kms_window_build_req_for_target(window, composition, &primary_target, &primary_req);
+    if (ok != 0) {
+        return ok;
+    }
+
+    if (window->mirror.enabled) {
+        struct mirror_present_target mirror_target = {
+            .crtc = window->mirror.crtc,
+            .connector = window->mirror.connector,
+            .mode = window->mirror.mode,
+            .should_apply_mode = &window->mirror.should_apply_mode,
+            .is_mirror = true,
+        };
+        ok = kms_window_build_req_for_target(window, composition, &mirror_target, &mirror_req);
+        if (ok != 0) {
+            LOG_ERROR("Mirror commit prep failed; disabling mirror permanently to avoid partial frames.\n");
+            window->mirror.enabled = false;
+            kms_req_unref(primary_req);
+            return ok;
+        }
+    }
+
+    frame = malloc(sizeof *frame);
+    if (frame == NULL) {
+        kms_req_unref(primary_req);
+        if (mirror_req != NULL) {
+            kms_req_unref(mirror_req);
+        }
+        return ENOMEM;
+    }
+
+    frame->req = primary_req;
+    frame->mirror_req = mirror_req;
+    frame->tracer = tracer_ref(window->tracer);
+    frame->unset_should_apply_mode_on_commit = window->kms.should_apply_mode;
+    frame->unset_mirror_should_apply_mode_on_commit = window->mirror.should_apply_mode;
+
+    if (mirror_req != NULL) {
+        frame_scheduler_present_frame_tandem(window->frame_scheduler, on_present_frame, frame, on_cancel_frame);
+    } else {
+        frame_scheduler_present_frame(window->frame_scheduler, on_present_frame, frame, on_cancel_frame);
+    }
 
     return 0;
-
-fail_unref_req:
-    kms_req_unref(req);
-    return ok;
-
-fail_unref_builder:
-    kms_req_builder_unref(builder);
-    return ok;
 }
 
 static int kms_window_push_composition(struct window *window, struct fl_layer_composition *composition) {
