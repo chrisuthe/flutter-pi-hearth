@@ -144,6 +144,13 @@ OPTIONS:\n\
 \n\
   --drm-fd                   An opened and valid DRM file descriptor\n\
 \n\
+  --mirror-connector NAME    Mirror the rendered output to a second connector\n\
+                             (e.g. HDMI-A-2). The mirror picks its preferred mode\n\
+                             independently and DRM scales the framebuffer.\n\
+                             If NAME is not connected at startup, mirroring is\n\
+                             disabled with a warning and the primary continues\n\
+                             to work.\n\
+\n\
   -h, --help                 Show this help and exit.\n\
 \n\
 EXAMPLES:\n\
@@ -1879,6 +1886,7 @@ bool flutterpi_parse_cmdline_args(int argc, char **argv, struct flutterpi_cmdlin
         { "dummy-display", no_argument, &dummy_display_int, 1 },
         { "dummy-display-size", required_argument, NULL, 's' },
         { "drm-fd", required_argument, NULL, 'f' },
+        { "mirror-connector", required_argument, NULL, 0 },
         { 0, 0, 0, 0 },
     };
     memset(result_out, 0, sizeof *result_out);
@@ -1901,7 +1909,14 @@ bool flutterpi_parse_cmdline_args(int argc, char **argv, struct flutterpi_cmdlin
 
         switch (opt) {
             case 0:
-                // flag was encountered. just continue
+                // flag was encountered; dispatch long-only options by name.
+                if (strcmp(long_options[longopt_index].name, "mirror-connector") == 0) {
+                    free(result_out->mirror_connector_name);
+                    result_out->mirror_connector_name = strdup(optarg);
+                    if (result_out->mirror_connector_name == NULL) {
+                        return false;
+                    }
+                }
                 break;
 
             case 'o':

@@ -144,6 +144,10 @@ struct flutterpi_cmdline_args {
 
     bool has_drm_fd;
     int drm_fd;
+
+    /// @brief Optional name of a second connector to mirror the
+    /// primary output to (e.g. "HDMI-A-2"). NULL = no mirror.
+    char *mirror_connector_name;
 };
 
 int flutterpi_fill_view_properties(bool has_orientation, enum device_orientation orientation, bool has_rotation, int rotation);
