@@ -914,7 +914,6 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     gst_base_sink_set_sync(GST_BASE_SINK(sink), TRUE);
     gst_app_sink_set_max_buffers(GST_APP_SINK(sink), 2);
     gst_app_sink_set_emit_signals(GST_APP_SINK(sink), TRUE);
-    gst_app_sink_set_drop(GST_APP_SINK(sink), FALSE);
 
     // configure our caps
     // we only accept video formats that we can actually upload to EGL
