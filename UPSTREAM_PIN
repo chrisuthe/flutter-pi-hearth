@@ -4,8 +4,11 @@ upstream_subject: don't enforce rotation
 pinned_at:   2026-05-08
 notes:
   - This fork carries Hearth-specific patches on the `hearth` branch.
-  - Rebase onto a newer upstream by: git remote add upstream <url>;
-    git fetch upstream; git rebase upstream/master; resolve; update
-    this file; force-push the `hearth` branch.
+  - Rebase procedure (the `upstream` remote should already be set;
+    if not, `git remote add upstream https://github.com/ardera/flutter-pi.git`):
+      1. `git fetch upstream`
+      2. `git rebase upstream/master`  (resolve any merge conflicts manually)
+      3. Update `upstream_sha`, `upstream_subject`, `pinned_at` below
+      4. Force-push: `git push --force-with-lease origin hearth github hearth`
   - Patches are in commits, not as text-replacement scripts.
   - DO NOT delete this file or the rebase tracking gets harder.
