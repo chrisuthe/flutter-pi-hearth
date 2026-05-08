@@ -176,6 +176,18 @@ struct window {
         bool has_cursor_plane;
     } kms;
 
+    /// @brief Optional mirror output, populated when the user passed
+    /// --mirror-connector on the command line and a connected
+    /// secondary connector with that name was found at startup.
+    struct {
+        bool enabled;
+        struct drm_connector *connector;
+        struct drm_encoder *encoder;
+        struct drm_crtc *crtc;
+        drmModeModeInfo *mode;
+        bool should_apply_mode;
+    } mirror;
+
     /**
      * @brief The type of rendering that should be used. (gl, vk)
      *
@@ -724,6 +736,106 @@ static void cursor_buffer_unref_with_locked_drmdev(void *userdata) {
     }
 }
 
+static struct drm_connector *find_connector_by_name(struct drmdev *drmdev, const char *name) {
+    struct drm_connector *connector;
+    char buf[32];
+
+    for_each_connector_in_drmdev(drmdev, connector) {
+        const char *type_str;
+        switch (connector->type) {
+            case DRM_MODE_CONNECTOR_HDMIA: type_str = "HDMI-A"; break;
+            case DRM_MODE_CONNECTOR_HDMIB: type_str = "HDMI-B"; break;
+            case DRM_MODE_CONNECTOR_DisplayPort: type_str = "DP"; break;
+            case DRM_MODE_CONNECTOR_DSI: type_str = "DSI"; break;
+            case DRM_MODE_CONNECTOR_VGA: type_str = "VGA"; break;
+            case DRM_MODE_CONNECTOR_DVII: type_str = "DVI-I"; break;
+            case DRM_MODE_CONNECTOR_DVID: type_str = "DVI-D"; break;
+            case DRM_MODE_CONNECTOR_DVIA: type_str = "DVI-A"; break;
+            case DRM_MODE_CONNECTOR_eDP: type_str = "eDP"; break;
+            default: type_str = "Unknown"; break;
+        }
+        snprintf(buf, sizeof buf, "%s-%u", type_str, connector->type_id);
+        if (strcmp(buf, name) == 0) {
+            return connector;
+        }
+    }
+    return NULL;
+}
+
+static int select_mirror_resources(
+    struct drmdev *drmdev,
+    struct drm_connector *connector,
+    struct drm_crtc *primary_crtc,
+    struct drm_encoder **encoder_out,
+    struct drm_crtc **crtc_out,
+    drmModeModeInfo **mode_out
+) {
+    struct drm_encoder *enc = NULL;
+    struct drm_crtc *crtc = NULL;
+    drmModeModeInfo *mode = NULL;
+    drmModeModeInfo *iter;
+
+    // Pick a usable encoder for this connector. The connector exposes
+    // a list of valid encoder IDs in its `encoders` array.
+    for (int i = 0; i < connector->n_encoders; i++) {
+        struct drm_encoder *e;
+        for_each_encoder_in_drmdev(drmdev, e) {
+            if (e->encoder->encoder_id == connector->encoders[i]) {
+                enc = e;
+                goto found_encoder;
+            }
+        }
+    }
+found_encoder:
+    if (enc == NULL) {
+        LOG_ERROR("Mirror connector has no usable encoder.\n");
+        return EINVAL;
+    }
+
+    // Pick a CRTC compatible with this encoder, distinct from the primary.
+    for_each_crtc_in_drmdev(drmdev, crtc) {
+        if (crtc == primary_crtc) {
+            continue;
+        }
+        if (enc->encoder->possible_crtcs & crtc->bitmask) {
+            break;
+        }
+    }
+    if (crtc == NULL) {
+        LOG_ERROR("Mirror connector has no free CRTC distinct from primary.\n");
+        return EINVAL;
+    }
+
+    // Pick the connector's preferred mode, falling back to the largest
+    // mode <= 1080p (capture-card friendly).
+    for_each_mode_in_connector(connector, iter) {
+        if (iter->type & DRM_MODE_TYPE_PREFERRED) {
+            mode = iter;
+            break;
+        }
+    }
+    if (mode == NULL) {
+        for_each_mode_in_connector(connector, iter) {
+            if (iter->hdisplay <= 1920 && iter->vdisplay <= 1080) {
+                if (mode == NULL ||
+                    (iter->hdisplay * iter->vdisplay) >
+                    (mode->hdisplay * mode->vdisplay)) {
+                    mode = iter;
+                }
+            }
+        }
+    }
+    if (mode == NULL) {
+        LOG_ERROR("Mirror connector advertises no usable mode.\n");
+        return EINVAL;
+    }
+
+    *encoder_out = enc;
+    *crtc_out = crtc;
+    *mode_out = mode;
+    return 0;
+}
+
 static int select_mode(
     struct drmdev *drmdev,
     struct drm_connector **connector_out,
@@ -901,7 +1013,8 @@ MUST_CHECK struct window *kms_window_new(
     bool has_explicit_dimensions, int width_mm, int height_mm,
     bool has_forced_pixel_format, enum pixfmt forced_pixel_format,
     struct drmdev *drmdev,
-    const char *desired_videomode
+    const char *desired_videomode,
+    const char *mirror_connector_name
     // clang-format on
 ) {
     struct window *window;
@@ -1000,6 +1113,48 @@ MUST_CHECK struct window *kms_window_new(
     window->kms.should_apply_mode = true;
     window->kms.cursor = NULL;
     window->kms.pointer_icon = NULL;
+
+    window->mirror.enabled = false;
+    window->mirror.connector = NULL;
+    window->mirror.encoder = NULL;
+    window->mirror.crtc = NULL;
+    window->mirror.mode = NULL;
+    window->mirror.should_apply_mode = false;
+
+    if (mirror_connector_name != NULL) {
+        struct drm_connector *mc;
+        struct drm_encoder *me;
+        struct drm_crtc *mcrtc;
+        drmModeModeInfo *mmode;
+
+        mc = find_connector_by_name(drmdev, mirror_connector_name);
+        if (mc == NULL) {
+            LOG_ERROR("Mirror connector '%s' not found; mirror disabled.\n",
+                      mirror_connector_name);
+        } else if (mc->variable_state.connection_state != kConnected_DrmConnectionState) {
+            LOG_ERROR("Mirror connector '%s' is not connected; mirror disabled.\n",
+                      mirror_connector_name);
+        } else if (select_mirror_resources(drmdev, mc, selected_crtc, &me, &mcrtc, &mmode) != 0) {
+            // already logged
+        } else {
+            window->mirror.enabled = true;
+            window->mirror.connector = mc;
+            window->mirror.encoder = me;
+            window->mirror.crtc = mcrtc;
+            window->mirror.mode = mmode;
+            window->mirror.should_apply_mode = true;
+            LOG_DEBUG_UNPREFIXED(
+                "mirror output:\n"
+                "  connector: %s\n"
+                "  mode: %ux%u@%uHz\n",
+                mirror_connector_name,
+                mmode->hdisplay,
+                mmode->vdisplay,
+                mode_get_vrefresh(mmode)
+            );
+        }
+    }
+
     window->renderer_type = renderer_type;
     if (gl_renderer != NULL) {
 #ifdef HAVE_EGL_GLES2

@@ -2582,7 +2582,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
             cmd_args.has_physical_dimensions, cmd_args.physical_dimensions.x, cmd_args.physical_dimensions.y,
             cmd_args.has_pixel_format, cmd_args.pixel_format,
             drmdev,
-            desired_videomode
+            desired_videomode,
+            cmd_args.mirror_connector_name
             // clang-format on
         );
         if (window == NULL) {

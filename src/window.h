@@ -65,7 +65,8 @@ struct window *kms_window_new(
     bool has_explicit_dimensions, int width_mm, int height_mm,
     bool has_forced_pixel_format, enum pixfmt forced_pixel_format,
     struct drmdev *drmdev,
-    const char *desired_videomode
+    const char *desired_videomode,
+    const char *mirror_connector_name
     // clang-format on
 );
 
