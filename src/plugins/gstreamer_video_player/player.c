@@ -926,7 +926,9 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
         gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, gst_video_format_to_string(gst_format), NULL));
     }
-    gst_app_sink_set_caps(GST_APP_SINK(sink), caps);
+    if (player->pipeline_description == NULL) {
+        gst_app_sink_set_caps(GST_APP_SINK(sink), caps);
+    }
     gst_caps_unref(caps);
 
     gst_app_sink_set_callbacks(
