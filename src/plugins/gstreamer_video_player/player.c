@@ -959,14 +959,24 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     flutterpi_sd_event_add_io(&busfd_event_source, fd.fd, EPOLLIN, on_bus_fd_ready, player);
 
-    LOG_DEBUG("Setting state to paused...\n");
-    state_change_return = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PAUSED);
-    if (state_change_return == GST_STATE_CHANGE_NO_PREROLL) {
-        LOG_DEBUG("Is Live!\n");
+    if (player->pipeline_description != NULL) {
+        // Custom pipelines (RTSP, HTTP live) — go straight to PLAYING.
+        // PAUSED would deadlock: live sources don't produce data until PLAYING,
+        // but init waits for video info that only arrives when data flows.
         player->is_live = true;
+        gst_base_sink_set_sync(GST_BASE_SINK(sink), FALSE);
+        gst_app_sink_set_drop(GST_APP_SINK(sink), TRUE);
+        state_change_return = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PLAYING);
     } else {
-        LOG_DEBUG("Not live!\n");
-        player->is_live = false;
+        LOG_DEBUG("Setting state to paused...\n");
+        state_change_return = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PAUSED);
+        if (state_change_return == GST_STATE_CHANGE_NO_PREROLL) {
+            LOG_DEBUG("Is Live!\n");
+            player->is_live = true;
+        } else {
+            LOG_DEBUG("Not live!\n");
+            player->is_live = false;
+        }
     }
 
     player->sink = sink;
