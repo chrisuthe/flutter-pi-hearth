@@ -8,6 +8,7 @@
 #include <pthread.h>
 
 #include <gst/gst.h>
+#include <gst/video/navigation.h>
 #include <gst/video/video-info.h>
 
 #include "flutter-pi.h"
@@ -44,7 +45,14 @@ struct gstplayer_meta {
 
     struct listener *video_info_listener;
     struct listener *buffering_state_listener;
+    struct listener *error_listener;
 };
+
+/// Global event channel name used to broadcast pipeline errors (e.g. wpesrc
+/// failures, WebProcess crashes) to all Dart-side subscribers. Events sent on
+/// this channel are maps of `{textureId: int, message: string}`. Used by the
+/// Hearth webview integration; safe to ignore for normal video playback.
+#define ERROR_EVENT_CHANNEL "flutterpi_gstreamer_video_player/error"
 
 static struct plugin {
     pthread_mutex_t lock;
@@ -52,6 +60,11 @@ static struct plugin {
     struct flutterpi *flutterpi;
     bool initialized;
     struct list_head players;
+
+    /// True iff the Dart side currently has a subscription on
+    /// @ref ERROR_EVENT_CHANNEL. Used to skip the platch_send call when
+    /// nothing is listening.
+    bool has_error_listener;
 } plugin;
 
 DEFINE_LOCK_OPS(plugin, lock);
@@ -352,6 +365,63 @@ static enum listener_return on_buffering_state_notify(void *arg, void *userdata)
     return kNoAction;
 }
 
+/// Listener callback for gstplayer error notifications. Forwards the error
+/// message to the Dart side via the global error event channel, tagged with
+/// the texture id so multi-player apps can route the event.
+///
+/// Called on the gstreamer bus-watch thread; @ref platch_send_success_event_std
+/// is expected to be MT-safe (matches the existing pattern used by
+/// @ref send_initialized_event from the same thread).
+static enum listener_return on_error_notify(void *arg, void *userdata) {
+    struct gstplayer_meta *meta;
+    const char *message;
+
+    ASSERT_NOT_NULL(userdata);
+    meta = userdata;
+
+    // Value-notifier replay may pass NULL on initial subscribe (before any
+    // error has actually happened). Ignore those.
+    if (arg == NULL) {
+        return kNoAction;
+    }
+    message = arg;
+
+    if (plugin.has_error_listener) {
+        platch_send_success_event_std(
+            ERROR_EVENT_CHANNEL,
+            &STDMAP2(
+                STDSTRING("textureId"),
+                STDINT64(gstplayer_get_texture_id(meta->player)),
+                STDSTRING("message"),
+                STDSTRING((char *) message)
+            )
+        );
+    }
+
+    return kNoAction;
+}
+
+/// Receiver for the global error event channel. Handles the standard Flutter
+/// EventChannel `listen` / `cancel` protocol so the Dart side can subscribe
+/// to pipeline errors.
+static int on_receive_error_evch(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const char *method;
+
+    (void) channel;
+
+    method = object->method;
+
+    if (streq("listen", method)) {
+        plugin.has_error_listener = true;
+        return platch_respond_success_std(responsehandle, NULL);
+    } else if (streq("cancel", method)) {
+        plugin.has_error_listener = false;
+        return platch_respond_success_std(responsehandle, NULL);
+    } else {
+        return platch_respond_not_implemented(responsehandle);
+    }
+}
+
 /*******************************************************
  * CHANNEL HANDLERS                                    *
  * handle method calls on the method and event channel *
@@ -496,6 +566,9 @@ static struct gstplayer_meta *create_meta(int64_t texture_id, struct gstplayer *
     meta->event_channel_name = event_channel_name;
     meta->has_listener = false;
     meta->is_buffering = false;
+    meta->video_info_listener = NULL;
+    meta->buffering_state_listener = NULL;
+    meta->error_listener = NULL;
     return meta;
 }
 
@@ -528,6 +601,10 @@ static void dispose_player(struct gstplayer *player, bool plugin_registry_locked
     if (meta->buffering_state_listener != NULL) {
         notifier_unlisten(gstplayer_get_buffering_state_notifier(player), meta->buffering_state_listener);
         meta->buffering_state_listener = NULL;
+    }
+    if (meta->error_listener != NULL) {
+        notifier_unlisten(gstplayer_get_error_notifier(player), meta->error_listener);
+        meta->error_listener = NULL;
     }
 
     destroy_meta(meta);
@@ -654,6 +731,13 @@ invalid_format_hint:
         goto fail_remove_player;
     }
 
+    // Subscribe to the player's error notifier. See the v2 create path for
+    // rationale. Non-fatal if it fails.
+    meta->error_listener = notifier_listen(gstplayer_get_error_notifier(player), on_error_notify, NULL, meta);
+    if (meta->error_listener == NULL) {
+        LOG_ERROR("Couldn't subscribe to gstplayer error notifier.\n");
+    }
+
     // Finally, start initializing
     ok = gstplayer_initialize(player);
     if (ok != 0) {
@@ -663,6 +747,10 @@ invalid_format_hint:
     return platch_respond_success_pigeon(responsehandle, &STDMAP1(STDSTRING("textureId"), STDINT64(gstplayer_get_texture_id(player))));
 
 fail_remove_receiver:
+    if (meta->error_listener != NULL) {
+        notifier_unlisten(gstplayer_get_error_notifier(player), meta->error_listener);
+        meta->error_listener = NULL;
+    }
     plugin_registry_remove_receiver(meta->event_channel_name);
 
 fail_remove_player:
@@ -1254,6 +1342,15 @@ invalid_headers:
         goto fail_remove_player;
     }
 
+    // Subscribe to the player's error notifier so we can forward bus errors
+    // (wpesrc failures, network errors, WebProcess crashes) to the Dart side
+    // via the global error event channel. Non-fatal if it fails — we just
+    // lose error reporting for this player.
+    meta->error_listener = notifier_listen(gstplayer_get_error_notifier(player), on_error_notify, NULL, meta);
+    if (meta->error_listener == NULL) {
+        LOG_ERROR("Couldn't subscribe to gstplayer error notifier.\n");
+    }
+
     // Finally, start initializing
     ok = gstplayer_initialize(player);
     if (ok != 0) {
@@ -1263,6 +1360,10 @@ invalid_headers:
     return platch_respond_success_std(responsehandle, &STDINT64(gstplayer_get_texture_id(player)));
 
 fail_remove_receiver:
+    if (meta->error_listener != NULL) {
+        notifier_unlisten(gstplayer_get_error_notifier(player), meta->error_listener);
+        meta->error_listener = NULL;
+    }
     plugin_registry_remove_receiver(meta->event_channel_name);
 
 fail_remove_player:
@@ -1536,6 +1637,144 @@ static int on_step_backward_v2(const struct raw_std_value *arg, FlutterPlatformM
     return platch_respond_success_std(responsehandle, &STDNULL);
 }
 
+/// Helper: read a double from a raw_std map entry, accepting both float64 and
+/// integer values. Returns true on success.
+static bool raw_std_map_get_double(const struct raw_std_value *map, const char *key, double *out) {
+    const struct raw_std_value *v = raw_std_map_find_str(map, key);
+    if (v == NULL) {
+        return false;
+    }
+    if (raw_std_value_is_float64(v)) {
+        *out = raw_std_value_as_float64(v);
+        return true;
+    }
+    if (raw_std_value_is_int(v)) {
+        *out = (double) raw_std_value_as_int(v);
+        return true;
+    }
+    return false;
+}
+
+/// Handler for `sendNavigationEvent`. Argument is a map:
+///   { textureId: int, type: string, button?: int, x: double, y: double,
+///     deltaX?: double, deltaY?: double }
+/// where `type` is one of "mouse-button-press", "mouse-button-release",
+/// "mouse-scroll". The constructed GstNavigation event is sent upstream into
+/// the player's pipeline (toward wpesrc / video source).
+static int on_send_navigation_event_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    struct gstplayer *player;
+    const struct raw_std_value *texture_id_v, *type_v, *button_v;
+    int64_t texture_id;
+    int button;
+    double x, y, delta_x, delta_y;
+    GstEvent *event;
+    int ok;
+
+    if (!raw_std_value_is_map(arg)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg` to be a Map.");
+    }
+
+    texture_id_v = raw_std_map_find_str(arg, "textureId");
+    if (texture_id_v == NULL || !raw_std_value_is_int(texture_id_v)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['textureId']` to be an integer.");
+    }
+    texture_id = raw_std_value_as_int(texture_id_v);
+
+    player = get_player_from_texture_id_with_custom_errmsg(texture_id, responsehandle, "Expected `arg['textureId']` to be a valid texture id.");
+    if (player == NULL) {
+        return 0;
+    }
+
+    type_v = raw_std_map_find_str(arg, "type");
+    if (type_v == NULL || !raw_std_value_is_string(type_v)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['type']` to be a string.");
+    }
+
+    if (!raw_std_map_get_double(arg, "x", &x) || !raw_std_map_get_double(arg, "y", &y)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['x']` and `arg['y']` to be numbers.");
+    }
+
+    if (raw_std_string_equals(type_v, "mouse-button-press") || raw_std_string_equals(type_v, "mouse-button-release")) {
+        button_v = raw_std_map_find_str(arg, "button");
+        if (button_v != NULL && raw_std_value_is_int(button_v)) {
+            button = (int) raw_std_value_as_int(button_v);
+        } else {
+            // Default to left mouse button when not specified.
+            button = 1;
+        }
+
+        if (raw_std_string_equals(type_v, "mouse-button-press")) {
+            event = gst_navigation_event_new_mouse_button_press(button, x, y, GST_NAVIGATION_MODIFIER_NONE);
+        } else {
+            event = gst_navigation_event_new_mouse_button_release(button, x, y, GST_NAVIGATION_MODIFIER_NONE);
+        }
+    } else if (raw_std_string_equals(type_v, "mouse-scroll")) {
+        if (!raw_std_map_get_double(arg, "deltaX", &delta_x)) {
+            delta_x = 0.0;
+        }
+        if (!raw_std_map_get_double(arg, "deltaY", &delta_y)) {
+            delta_y = 0.0;
+        }
+        event = gst_navigation_event_new_mouse_scroll(x, y, delta_x, delta_y, GST_NAVIGATION_MODIFIER_NONE);
+    } else {
+        return platch_respond_illegal_arg_std(
+            responsehandle,
+            "Expected `arg['type']` to be one of 'mouse-button-press', 'mouse-button-release', 'mouse-scroll'."
+        );
+    }
+
+    if (event == NULL) {
+        return platch_respond_native_error_std(responsehandle, ENOMEM);
+    }
+
+    ok = gstplayer_send_event(player, (struct _GstEvent *) event);
+    if (ok != 0) {
+        return platch_respond_native_error_std(responsehandle, ok);
+    }
+
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+/// Handler for `setPipelineState`. Argument is `[textureId, state]`, where
+/// `state` is a string ("PLAYING" or "PAUSED"). Bypasses the gstplayer
+/// playpause state machine and pokes the pipeline directly — useful for
+/// webview idle-suspend.
+static int on_set_pipeline_state_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *second;
+    struct gstplayer *player;
+    char *state;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 2, responsehandle);
+    if (ok != 0) {
+        return 0;
+    }
+
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) {
+        return 0;
+    }
+
+    second = raw_std_list_get_nth_element(arg, 1);
+    if (!raw_std_value_is_string(second)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a string.");
+    }
+
+    state = raw_std_string_dup(second);
+    if (state == NULL) {
+        return platch_respond_native_error_std(responsehandle, ENOMEM);
+    }
+
+    ok = gstplayer_set_pipeline_state(player, state);
+    free(state);
+
+    if (ok != 0) {
+        return platch_respond_native_error_std(responsehandle, ok);
+    }
+
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
 static int on_receive_method_channel_v2(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *responsehandle) {
     const struct raw_std_value *envelope, *method, *arg;
 
@@ -1583,6 +1822,10 @@ static int on_receive_method_channel_v2(char *channel, struct platch_obj *object
         return on_step_backward_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "fastSeek")) {
         return on_fast_seek_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "sendNavigationEvent")) {
+        return on_send_navigation_event_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "setPipelineState")) {
+        return on_set_pipeline_state_v2(arg, responsehandle);
     } else {
         return platch_respond_not_implemented(responsehandle);
     }
@@ -1595,6 +1838,7 @@ enum plugin_init_result gstplayer_plugin_init(struct flutterpi *flutterpi, void 
 
     plugin.flutterpi = flutterpi;
     plugin.initialized = false;
+    plugin.has_error_listener = false;
 
     ok = pthread_mutex_init(&plugin.lock, get_default_mutex_attrs());
     if (ok != 0) {
@@ -1680,7 +1924,15 @@ enum plugin_init_result gstplayer_plugin_init(struct flutterpi *flutterpi, void 
         goto fail_remove_advancedControls_receiver;
     }
 
+    ok = plugin_registry_set_receiver_locked(ERROR_EVENT_CHANNEL, kStandardMethodCall, on_receive_error_evch);
+    if (ok != 0) {
+        goto fail_remove_method_channel_v2_receiver;
+    }
+
     return PLUGIN_INIT_RESULT_INITIALIZED;
+
+fail_remove_method_channel_v2_receiver:
+    plugin_registry_remove_receiver_locked("flutter-pi/gstreamerVideoPlayer");
 
 fail_remove_advancedControls_receiver:
     plugin_registry_remove_receiver_locked("flutter.io/videoPlayer/gstreamerVideoPlayer/advancedControls");
@@ -1741,6 +1993,7 @@ void gstplayer_plugin_deinit(struct flutterpi *flutterpi, void *userdata) {
 
     plugin_unlock(&plugin);
 
+    plugin_registry_remove_receiver_locked(ERROR_EVENT_CHANNEL);
     plugin_registry_remove_receiver_locked("flutter-pi/gstreamerVideoPlayer");
     plugin_registry_remove_receiver_locked("flutter.io/videoPlayer/gstreamerVideoPlayer/advancedControls");
     plugin_registry_remove_receiver_locked("dev.flutter.pigeon.VideoPlayerApi.setMixWithOthers");

@@ -164,6 +164,23 @@ int gstplayer_step_forward(struct gstplayer *player);
 
 int gstplayer_step_backward(struct gstplayer *player);
 
+/// Directly set the underlying GStreamer pipeline state, bypassing the normal
+/// playpause state machine. Used for webview-style idle suspend where the
+/// caller wants a literal PLAYING/PAUSED transition without affecting seeking,
+/// buffering, or loop logic.
+///     @arg state    One of "PLAYING" or "PAUSED". Other values return EINVAL.
+///     @returns 0 on success, errno-style error code on failure.
+int gstplayer_set_pipeline_state(struct gstplayer *player, const char *state);
+
+/// Send a GStreamer event upstream into the pipeline. The pipeline takes
+/// ownership of the event (per GStreamer convention) regardless of success.
+/// Used to push GstNavigation events (clicks, scrolls) into a wpesrc-based
+/// pipeline.
+///     @arg event    The event to send. Transfer full ownership.
+///     @returns 0 on success, EIO if gst_element_send_event returned FALSE.
+struct _GstEvent;
+int gstplayer_send_event(struct gstplayer *player, struct _GstEvent *event);
+
 /// @brief Get the value notifier for the video info.
 ///
 /// Gets notified with a value of type `struct video_info*` when the video info changes.
@@ -179,7 +196,11 @@ struct notifier *gstplayer_get_buffering_state_notifier(struct gstplayer *player
 
 /// @brief Get the change notifier for errors.
 ///
-/// Gets notified when an error happens. (Not yet implemented)
+/// Gets notified when a GST_MESSAGE_ERROR is received on the pipeline bus.
+/// The notifier value is a freshly-allocated `char *` containing the error
+/// message; the listener is responsible for freeing it (or rely on the
+/// notifier framework's destroy callback). The listener will be invoked on
+/// the bus-watch thread.
 struct notifier *gstplayer_get_error_notifier(struct gstplayer *player);
 
 struct video_frame;

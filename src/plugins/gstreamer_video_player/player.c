@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <pthread.h>
 
@@ -483,6 +484,17 @@ static void on_bus_message(struct gstplayer *player, GstMessage *msg) {
                 error->message,
                 debug_info
             );
+
+            // Notify listeners (e.g. the plugin error event channel) with a
+            // duplicated message string. The destroy callback registered when
+            // the error_notifier was initialized takes care of freeing.
+            if (error->message != NULL) {
+                char *message_dup = strdup(error->message);
+                if (message_dup != NULL) {
+                    notifier_notify(&player->error_notifier, message_dup);
+                }
+            }
+
             g_clear_error(&error);
             g_free(debug_info);
             break;
@@ -1076,7 +1088,10 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     if (ok != 0)
         goto fail_deinit_video_info_notifier;
 
-    ok = change_notifier_init(&player->error_notifier);
+    // Use a value notifier so the strduped error message gets freed when a
+    // new error supersedes it (and when the notifier is deinit-ed). The
+    // initial NULL state is fine — listeners ignore NULL.
+    ok = value_notifier_init(&player->error_notifier, NULL, free);
     if (ok != 0)
         goto fail_deinit_buffering_state_notifier;
 
@@ -1329,6 +1344,50 @@ int gstplayer_step_backward(struct gstplayer *player) {
     gst_ok = gst_element_send_event(player->pipeline, gst_event_new_step(GST_FORMAT_BUFFERS, 1, 1, TRUE, FALSE));
     if (gst_ok == FALSE) {
         LOG_ERROR("Could not send frame-step event to pipeline. (gst_element_send_event)\n");
+        return EIO;
+    }
+
+    return 0;
+}
+
+int gstplayer_set_pipeline_state(struct gstplayer *player, const char *state) {
+    GstStateChangeReturn ok;
+    GstState target;
+
+    ASSERT_NOT_NULL(player);
+    ASSERT_NOT_NULL(state);
+
+    if (streq(state, "PLAYING")) {
+        target = GST_STATE_PLAYING;
+    } else if (streq(state, "PAUSED")) {
+        target = GST_STATE_PAUSED;
+    } else {
+        return EINVAL;
+    }
+
+    DEBUG_TRACE_BEGIN(player, "gst_element_set_state");
+    ok = gst_element_set_state(player->pipeline, target);
+    DEBUG_TRACE_END(player, "gst_element_set_state");
+
+    if (ok == GST_STATE_CHANGE_FAILURE) {
+        LOG_GST_SET_STATE_ERROR(player->pipeline);
+        return EIO;
+    }
+
+    return 0;
+}
+
+int gstplayer_send_event(struct gstplayer *player, struct _GstEvent *event) {
+    gboolean gst_ok;
+
+    ASSERT_NOT_NULL(player);
+    ASSERT_NOT_NULL(event);
+
+    gst_ok = gst_element_send_event(player->pipeline, (GstEvent *) event);
+    if (gst_ok == FALSE) {
+        // Note: gst_element_send_event takes ownership of the event regardless
+        // of return value, so we don't unref on failure.
+        LOG_ERROR("Could not send event to pipeline. (gst_element_send_event)\n");
         return EIO;
     }
 
