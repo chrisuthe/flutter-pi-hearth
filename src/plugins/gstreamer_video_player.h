@@ -117,6 +117,19 @@ int64_t gstplayer_get_texture_id(struct gstplayer *player);
 /// This has no effect after @ref gstplayer_initialize was called.
 void gstplayer_put_http_header(struct gstplayer *player, const char *key, const char *value);
 
+/// Register a document-start init script for a `wpesrc`-based webview pipeline.
+///
+/// [script] is JavaScript run before each page bootstraps, via a
+/// `WebKitUserScript` injected at document-start on the WebView's user-content
+/// manager (used to seed an auth token into `localStorage`). [allow_origin] is
+/// a URL-match pattern (e.g. `https://ha.example.com/*`) scoping the script to
+/// a single origin; pass NULL to leave it unrestricted. Both may be NULL to
+/// clear. The pipeline must name its `wpesrc` element `websrc`.
+///
+/// Has no effect after @ref gstplayer_initialize, and is a no-op (script never
+/// runs) when flutter-pi was built without WPE WebKit headers.
+void gstplayer_set_webview_init_script(struct gstplayer *player, const char *script, const char *allow_origin);
+
 /// Initializes the video playback, i.e. boots up the gstreamer pipeline, starts
 /// buffering the video.
 ///     @returns 0 if initialization was successfull, errno-style error code if an error ocurred.

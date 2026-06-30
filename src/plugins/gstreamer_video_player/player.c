@@ -16,6 +16,10 @@
 #include <gst/video/gstvideometa.h>
 #include <sys/eventfd.h>
 
+#ifdef HAVE_WPE_WEBKIT
+    #include <wpe/webkit.h>
+#endif
+
 #include "flutter-pi.h"
 #include "notifier_listener.h"
 #include "platformchannel.h"
@@ -78,6 +82,12 @@ struct gstplayer {
 
     char *video_uri;
     char *pipeline_description;
+
+    /// Optional document-start JS injected into a `wpesrc` WebView (named
+    /// `websrc` in the pipeline) and its URL-match allow pattern. NULL unless
+    /// set via @ref gstplayer_set_webview_init_script. See that function.
+    char *webview_init_script;
+    char *webview_init_script_allow_origin;
 
     GstStructure *headers;
 
@@ -854,6 +864,42 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
     }
 }
 
+#ifdef HAVE_WPE_WEBKIT
+/// `configure-web-view` handler for a `wpesrc` element. Fires when the element
+/// creates its WebView, before the page loads — the right moment to register a
+/// document-start user script. Registers @ref gstplayer.webview_init_script on
+/// the WebView's user-content manager, scoped (if set) to the allow pattern so
+/// the script only runs on the intended origin.
+static void on_configure_web_view(GstElement *src, GObject *webview, gpointer userdata) {
+    struct gstplayer *player = userdata;
+
+    (void) src;
+
+    if (player->webview_init_script == NULL) {
+        return;
+    }
+
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(webview));
+    if (ucm == NULL) {
+        LOG_ERROR("wpesrc WebView has no user content manager; can't inject webview init script.\n");
+        return;
+    }
+
+    const char *const allow_list[] = { player->webview_init_script_allow_origin, NULL };
+
+    WebKitUserScript *script = webkit_user_script_new(
+        player->webview_init_script,
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        player->webview_init_script_allow_origin != NULL ? allow_list : NULL,
+        NULL
+    );
+
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
+}
+#endif
+
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
@@ -964,6 +1010,22 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
         gst_object_unref(src);
         src = NULL;
     }
+
+#ifdef HAVE_WPE_WEBKIT
+    // For webview pipelines carrying a document-start init script, hook the
+    // `wpesrc` (named `websrc`) so we can register the script on its WebView
+    // before the page loads. Connected before the state change below, which is
+    // when wpesrc creates the WebView and emits `configure-web-view`.
+    if (player->webview_init_script != NULL) {
+        GstElement *websrc = gst_bin_get_by_name(GST_BIN(pipeline), "websrc");
+        if (websrc != NULL) {
+            g_signal_connect(websrc, "configure-web-view", G_CALLBACK(on_configure_web_view), player);
+            gst_object_unref(websrc);
+        } else {
+            LOG_ERROR("Couldn't find \"websrc\" (wpesrc) element to register the webview init script.\n");
+        }
+    }
+#endif
 
     bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
 
@@ -1099,6 +1161,8 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->userdata = userdata;
     player->video_uri = uri_owned;
     player->pipeline_description = pipeline_descr_owned;
+    player->webview_init_script = NULL;
+    player->webview_init_script_allow_origin = NULL;
     player->headers = gst_headers;
     player->playback_rate_forward = 1.0;
     player->playback_rate_backward = 1.0;
@@ -1206,6 +1270,12 @@ void gstplayer_destroy(struct gstplayer *player) {
     if (player->pipeline_description != NULL) {
         free(player->pipeline_description);
     }
+    if (player->webview_init_script != NULL) {
+        free(player->webview_init_script);
+    }
+    if (player->webview_init_script_allow_origin != NULL) {
+        free(player->webview_init_script_allow_origin);
+    }
     frame_interface_unref(player->frame_interface);
     texture_destroy(player->texture);
     free(player);
@@ -1219,6 +1289,17 @@ void gstplayer_put_http_header(struct gstplayer *player, const char *key, const 
     GValue gvalue = G_VALUE_INIT;
     g_value_set_string(&gvalue, value);
     gst_structure_take_value(player->headers, key, &gvalue);
+}
+
+void gstplayer_set_webview_init_script(struct gstplayer *player, const char *script, const char *allow_origin) {
+    if (player->webview_init_script != NULL) {
+        free(player->webview_init_script);
+    }
+    if (player->webview_init_script_allow_origin != NULL) {
+        free(player->webview_init_script_allow_origin);
+    }
+    player->webview_init_script = script != NULL ? strdup(script) : NULL;
+    player->webview_init_script_allow_origin = allow_origin != NULL ? strdup(allow_origin) : NULL;
 }
 
 void gstplayer_set_userdata_locked(struct gstplayer *player, void *userdata) {
