@@ -343,6 +343,19 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
         PkgConfig::LIBGSTREAMER_ALLOCATORS
         PkgConfig::LIBGSTREAMER_VIDEO
       )
+
+      # Optional: WPE WebKit lets the webview (wpesrc) pipeline register a
+      # document-start user script on the WebView (used to seed the HA auth
+      # token into localStorage). If the dev headers aren't present the feature
+      # compiles out — webview rendering still works, just without injection —
+      # so this never breaks a build that lacks WPE WebKit.
+      pkg_check_modules(LIBWPE_WEBKIT IMPORTED_TARGET wpe-webkit-2.0)
+      if (LIBWPE_WEBKIT_FOUND)
+        target_link_libraries(flutterpi_module PUBLIC PkgConfig::LIBWPE_WEBKIT)
+        target_compile_definitions(flutterpi_module PRIVATE HAVE_WPE_WEBKIT)
+      else()
+        message(NOTICE "WPE WebKit (wpe-webkit-2.0) not found; webview auth-token injection will be disabled.")
+      endif()
     else()
       message(NOTICE "Couldn't find gstreamer libraries. Gstreamer video player plugin won't be build.")
     endif()

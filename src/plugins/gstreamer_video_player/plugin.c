@@ -1143,6 +1143,7 @@ static int on_create_v2(const struct raw_std_value *arg, FlutterPlatformMessageR
     struct gstplayer *player;
     enum format_hint format_hint;
     char *asset, *uri, *package_name, *pipeline;
+    char *webview_init_script, *webview_init_script_allow_origin;
     size_t size;
     int ok;
 
@@ -1276,6 +1277,36 @@ invalid_headers:
         pipeline = NULL;
     }
 
+    // arg[6]: Webview document-start init script (optional; pipeline only)
+    if (size >= 7) {
+        arg = raw_std_value_after(arg);
+
+        if (raw_std_value_is_null(arg)) {
+            webview_init_script = NULL;
+        } else if (raw_std_value_is_string(arg)) {
+            webview_init_script = raw_std_string_dup(arg);
+        } else {
+            return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[6]` to be a string or null.");
+        }
+    } else {
+        webview_init_script = NULL;
+    }
+
+    // arg[7]: Webview init-script allowed-origin match pattern (optional)
+    if (size >= 8) {
+        arg = raw_std_value_after(arg);
+
+        if (raw_std_value_is_null(arg)) {
+            webview_init_script_allow_origin = NULL;
+        } else if (raw_std_value_is_string(arg)) {
+            webview_init_script_allow_origin = raw_std_string_dup(arg);
+        } else {
+            return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[7]` to be a string or null.");
+        }
+    } else {
+        webview_init_script_allow_origin = NULL;
+    }
+
     if ((asset ? 1 : 0) + (uri ? 1 : 0) + (pipeline ? 1 : 0) != 1) {
         return platch_respond_illegal_arg_std(responsehandle, "Expected exactly one of `arg[0]`, `arg[2]` or `arg[5]` to be non-null.");
     }
@@ -1331,6 +1362,19 @@ invalid_headers:
             free(header_value_duped);
             free(header_name_duped);
         }
+    }
+
+    // Apply the optional webview document-start init script. The setter dups
+    // internally, so the local copies are freed right after. No-op for
+    // non-webview players (they have no `websrc` element).
+    gstplayer_set_webview_init_script(player, webview_init_script, webview_init_script_allow_origin);
+    if (webview_init_script != NULL) {
+        free(webview_init_script);
+        webview_init_script = NULL;
+    }
+    if (webview_init_script_allow_origin != NULL) {
+        free(webview_init_script_allow_origin);
+        webview_init_script_allow_origin = NULL;
     }
 
     // Add it to our player collection
