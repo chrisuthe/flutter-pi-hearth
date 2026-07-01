@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-01
 - **Repo:** flutter-pi-hearth (embedder) + Hearth (Dart app) — cross-repo
-- **Status:** Design approved, pending implementation plan
+- **Status:** Phase 0 spike **PASSED** on-device (2026-07-01) — see "Phase 0 result" at the end. Phase 1 (warm-tab pool) pending; it is primarily a Hearth (Dart) repo change plus re-applying the validated native shared display+context.
 - **Supersedes direction of:** `docs/specs/2026-07-01-wpe-shared-egl-display-design.md` (Phase A/B "EGL display sharing"), whose on-Pi validation reframed the problem (see Background).
 - **Related:** Hearth PR #170 (one-live-session cap, the current stable behavior)
 
@@ -91,3 +91,14 @@ If concurrent `wpevideosrc` cannot be made stable, the "correct" architecture is
 - Wrapped `GstGLContext` `fill_info` threading — lazy in 1.26, or explicit activation on a controlled thread? (Resolve in Phase 0.)
 - Practical warm-tab count N on the target Pi given RAM. (Measure in Phase 0.)
 - Is serialized single-teardown sufficient to avoid the `releaseImage` UAF on tab removal, or is removal inherently unsafe until an upstream fix?
+
+## Phase 0 result (2026-07-01) — PASSED
+
+On the dev Pi (gst 1.26.2 / WPE 2.48.3), with the native shared `GstGLDisplay` + wrapped `GstGLContext` (`gst.gl.app_context`) provided to every pipeline, a throwaway harness (`FLUTTERPI_WPE_SPIKE`) stood up **two** `wpevideosrc` pipelines and kept them alive alongside the Dart app's one live webview:
+
+- **3 concurrent WPE web processes coexisted** (≈372–416 MB each) for a >130 s soak with **zero** SIGSEGV and **zero** "Multiple EGL displays" — no creation crash (#1386 does not bite on this stack), no teardown crash (nothing was torn down).
+- The wrapped `app_context` worked **without** the `fill_info` activation fallback.
+- The earlier switch-crash is thereby **isolated to teardown** (PR #170's dispose-on-switch), confirming the design's central bet: keep views alive, never tear down on switch.
+- **RAM:** ~400 MB per live tab (heavy HA dashboards); N≈2–3 warm tabs is the practical ceiling on a 4 GB+ Pi. Phase 1 must bound the pool accordingly.
+
+**Decision: proceed to Phase 1 (warm-tab pool), not the direct-embedding fallback.** The validated native groundwork (shared display + wrapped context) lives in git history — commits `6f348c3`, `be060af`, `0b188cb`, `66f3e45` (reverted from mainline for kiosk safety in `9ac548b`, since without the pool it still crashes on PR #170's teardown) — to be re-applied together with the pool. The throwaway harness (`7dab197`) is not reused.
