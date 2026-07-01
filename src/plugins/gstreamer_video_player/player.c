@@ -1027,6 +1027,77 @@ static GstBusSyncReply on_bus_sync_message(GstBus *bus, GstMessage *msg, gpointe
 
     return GST_BUS_PASS;
 }
+
+/// THROWAWAY Phase-0 spike: prove two concurrent wpevideosrc coexist. Runs once,
+/// only when FLUTTERPI_WPE_SPIKE="url1;url2" is set. Keeps both pipelines alive
+/// for the process lifetime (no teardown — that's the whole point). Remove after
+/// Phase 0. The stubs are process-lifetime so the sync handler's player->flutterpi
+/// read stays valid.
+static struct gstplayer wpe_spike_stubs[2];
+
+static void wpe_spike_run(struct flutterpi *flutterpi) {
+    const char *spec = getenv("FLUTTERPI_WPE_SPIKE");
+    if (spec == NULL) {
+        return;
+    }
+
+    char *dup = strdup(spec);
+    char *sep = strchr(dup, ';');
+    if (sep == NULL) {
+        LOG_ERROR("FLUTTERPI_WPE_SPIKE needs 'url1;url2'\n");
+        free(dup);
+        return;
+    }
+    *sep = '\0';
+    const char *urls[2] = { dup, sep + 1 };
+
+    for (int i = 0; i < 2; i++) {
+        char desc[1024];
+        snprintf(
+            desc,
+            sizeof desc,
+            "wpevideosrc name=websrc location=%s draw-background=false ! videoconvert ! fakesink sync=false",
+            urls[i]
+        );
+
+        GError *err = NULL;
+        GstElement *pipeline = gst_parse_launch(desc, &err);
+        if (pipeline == NULL) {
+            LOG_ERROR("WPE_SPIKE pipeline %d parse failed: %s\n", i, err != NULL ? err->message : "?");
+            if (err != NULL) {
+                g_error_free(err);
+            }
+            continue;
+        }
+
+        wpe_spike_stubs[i].flutterpi = flutterpi;
+
+        GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
+        gst_bus_set_sync_handler(bus, on_bus_sync_message, &wpe_spike_stubs[i], NULL);
+
+        GstGLDisplay *display = get_shared_gl_display(flutterpi);
+        if (display != NULL) {
+            GstContext *c = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
+            gst_context_set_gl_display(c, display);
+            gst_element_set_context(pipeline, c);
+            gst_context_unref(c);
+        }
+
+        GstGLContext *gl_context = get_shared_gl_context(flutterpi);
+        if (gl_context != NULL) {
+            GstContext *c = gst_context_new("gst.gl.app_context", TRUE);
+            gst_structure_set(gst_context_writable_structure(c), "context", GST_TYPE_GL_CONTEXT, gl_context, NULL);
+            gst_element_set_context(pipeline, c);
+            gst_context_unref(c);
+        }
+        gst_object_unref(bus);
+
+        GstStateChangeReturn r = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        LOG_ERROR("WPE_SPIKE pipeline %d (%s) set_state PLAYING = %d\n", i, urls[i], (int) r);
+        // Intentionally keep pipeline (and dup, referenced by location) alive for
+        // the process lifetime. No teardown.
+    }
+}
 #endif
 
 static int init(struct gstplayer *player, bool force_sw_decoders) {
@@ -1265,6 +1336,15 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
 
     ASSERT_NOT_NULL(flutterpi);
     assert((uri != NULL) != (pipeline_descr != NULL));
+
+#ifdef HAVE_GSTREAMER_GL
+    // THROWAWAY Phase-0 spike hook: fires once, only when FLUTTERPI_WPE_SPIKE is set.
+    static gsize wpe_spike_once = 0;
+    if (g_once_init_enter(&wpe_spike_once)) {
+        wpe_spike_run(flutterpi);
+        g_once_init_leave(&wpe_spike_once, 1);
+    }
+#endif
 
     player = malloc(sizeof *player);
     if (player == NULL)
