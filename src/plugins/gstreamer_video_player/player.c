@@ -938,7 +938,10 @@ static gpointer create_shared_gl_display(gpointer userdata) {
 /// Shared across every wpevideosrc pipeline so all WPE instances reference the
 /// same EGL display (WPE WebKit enforces one EGL display per process). Never
 /// torn down; lifetime matches the process EGL display. Does not transfer
-/// ownership — callers must not unref. May return NULL if EGL isn't ready.
+/// ownership — callers must not unref. The result is memoized by g_once: if the
+/// first call cannot obtain the EGL display it caches NULL for the process
+/// lifetime (unreachable in practice — a valid EGL display always exists by the
+/// time the first pipeline reaches init()).
 static GstGLDisplay *get_shared_gl_display(struct flutterpi *flutterpi) {
     static GOnce once = G_ONCE_INIT;
     return g_once(&once, create_shared_gl_display, flutterpi);
@@ -947,7 +950,8 @@ static GstGLDisplay *get_shared_gl_display(struct flutterpi *flutterpi) {
 /// Bus SYNC handler: answers GstGL's context negotiation synchronously, on the
 /// streaming thread, before the element falls back to creating its own display.
 /// Handles only the gst.gl.GLDisplay request; everything else passes through to
-/// the async on_bus_message watch. Touches no player state.
+/// the async on_bus_message watch. Reads only the immutable player->flutterpi —
+/// no mutable player state — so it is safe to run on the streaming thread.
 static GstBusSyncReply on_bus_sync_message(GstBus *bus, GstMessage *msg, gpointer userdata) {
     struct gstplayer *player = userdata;
 
