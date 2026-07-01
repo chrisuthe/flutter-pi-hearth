@@ -356,20 +356,6 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       else()
         message(NOTICE "WPE WebKit (wpe-webkit-2.0) not found; webview auth-token injection will be disabled.")
       endif()
-
-      # Optional: gstreamer-gl lets the embedder hand every wpevideosrc pipeline
-      # a single shared GstGLDisplay wrapping flutter-pi's one EGL display. WPE
-      # WebKit allows only one EGL display per process, so without a shared
-      # display a second live webview trips "Multiple EGL displays are not
-      # supported" and SIGSEGVs. If gstreamer-gl isn't present the sharing
-      # compiles out (single-webview behavior), so this never breaks a build.
-      pkg_check_modules(LIBGSTREAMER_GL IMPORTED_TARGET gstreamer-gl-1.0)
-      if (LIBGSTREAMER_GL_FOUND)
-        target_link_libraries(flutterpi_module PUBLIC PkgConfig::LIBGSTREAMER_GL)
-        target_compile_definitions(flutterpi_module PRIVATE HAVE_GSTREAMER_GL)
-      else()
-        message(NOTICE "gstreamer-gl (gstreamer-gl-1.0) not found; multiple concurrent WPE webviews will not be supported (single-display sharing disabled).")
-      endif()
     else()
       message(NOTICE "Couldn't find gstreamer libraries. Gstreamer video player plugin won't be build.")
     endif()

@@ -20,13 +20,6 @@
     #include <wpe/webkit.h>
 #endif
 
-#ifdef HAVE_GSTREAMER_GL
-    #include <gst/gl/egl/gstgldisplay_egl.h>
-    #include <gst/gl/gl.h>
-
-    #include "gl_renderer.h"
-#endif
-
 #include "flutter-pi.h"
 #include "notifier_listener.h"
 #include "platformchannel.h"
@@ -907,199 +900,6 @@ static void on_configure_web_view(GstElement *src, GObject *webview, gpointer us
 }
 #endif
 
-#ifdef HAVE_GSTREAMER_GL
-/// Builds the process-global GstGLDisplay wrapping flutter-pi's single EGL
-/// display. Called exactly once via g_once. Returns NULL (logged) if the GL
-/// renderer or EGL display isn't available.
-static gpointer create_shared_gl_display(gpointer userdata) {
-    struct flutterpi *flutterpi = userdata;
-
-    struct gl_renderer *renderer = flutterpi_get_gl_renderer(flutterpi);
-    if (renderer == NULL) {
-        LOG_ERROR("Can't create shared GstGLDisplay: no GL renderer available.\n");
-        return NULL;
-    }
-
-    EGLDisplay egl_display = gl_renderer_get_egl_display(renderer);
-    if (egl_display == EGL_NO_DISPLAY) {
-        LOG_ERROR("Can't create shared GstGLDisplay: no EGL display available.\n");
-        return NULL;
-    }
-
-    GstGLDisplay *display = GST_GL_DISPLAY(gst_gl_display_egl_new_with_egl_display(egl_display));
-    if (display == NULL) {
-        LOG_ERROR("gst_gl_display_egl_new_with_egl_display() returned NULL.\n");
-    }
-
-    return display;
-}
-
-/// Returns the process-global shared GstGLDisplay, creating it on first use.
-/// Shared across every wpevideosrc pipeline so all WPE instances reference the
-/// same EGL display (WPE WebKit enforces one EGL display per process). Never
-/// torn down; lifetime matches the process EGL display. Does not transfer
-/// ownership — callers must not unref. The result is memoized by g_once: if the
-/// first call cannot obtain the EGL display it caches NULL for the process
-/// lifetime (unreachable in practice — a valid EGL display always exists by the
-/// time the first pipeline reaches init()).
-static GstGLDisplay *get_shared_gl_display(struct flutterpi *flutterpi) {
-    static GOnce once = G_ONCE_INIT;
-    return g_once(&once, create_shared_gl_display, flutterpi);
-}
-
-/// Builds the process-global wrapped GstGLContext over one of flutter-pi's
-/// shared EGL contexts, so gstwpe's internal GL context is created sharing GL
-/// objects with flutter-pi (required for the exported-image/appsink handoff
-/// and for multiple wpevideosrc to agree on one context). g_once; may return NULL.
-static gpointer create_shared_gl_context(gpointer userdata) {
-    struct flutterpi *flutterpi = userdata;
-
-    GstGLDisplay *display = get_shared_gl_display(flutterpi);
-    if (display == NULL) {
-        LOG_ERROR("Can't create shared GstGLContext: no shared GstGLDisplay.\n");
-        return NULL;
-    }
-
-    struct gl_renderer *renderer = flutterpi_get_gl_renderer(flutterpi);
-    EGLContext egl_context = gl_renderer_create_context(renderer);
-    if (egl_context == EGL_NO_CONTEXT) {
-        LOG_ERROR("Can't create shared GstGLContext: gl_renderer_create_context failed.\n");
-        return NULL;
-    }
-
-    GstGLContext *context =
-        gst_gl_context_new_wrapped(display, (guintptr) egl_context, GST_GL_PLATFORM_EGL, GST_GL_API_GLES2);
-    if (context == NULL) {
-        LOG_ERROR("gst_gl_context_new_wrapped() returned NULL.\n");
-    }
-
-    return context;
-}
-
-/// Returns the process-global wrapped GstGLContext, creating it on first use.
-/// Does not transfer ownership. May return NULL if EGL/display isn't ready.
-static GstGLContext *get_shared_gl_context(struct flutterpi *flutterpi) {
-    static GOnce once = G_ONCE_INIT;
-    return g_once(&once, create_shared_gl_context, flutterpi);
-}
-
-/// Bus SYNC handler: answers GstGL's context negotiation synchronously, on the
-/// streaming thread, before the element falls back to creating its own display.
-/// Handles the gst.gl.GLDisplay and gst.gl.app_context requests; everything else
-/// passes through to the async on_bus_message watch. Reads only the immutable player->flutterpi —
-/// no mutable player state — so it is safe to run on the streaming thread.
-static GstBusSyncReply on_bus_sync_message(GstBus *bus, GstMessage *msg, gpointer userdata) {
-    struct gstplayer *player = userdata;
-
-    (void) bus;
-
-    if (GST_MESSAGE_TYPE(msg) != GST_MESSAGE_NEED_CONTEXT) {
-        return GST_BUS_PASS;
-    }
-
-    const gchar *context_type = NULL;
-    gst_message_parse_context_type(msg, &context_type);
-
-    if (g_strcmp0(context_type, GST_GL_DISPLAY_CONTEXT_TYPE) == 0) {
-        GstGLDisplay *display = get_shared_gl_display(player->flutterpi);
-        if (display == NULL) {
-            // Can't satisfy it; let the element self-provision rather than crash here.
-            return GST_BUS_PASS;
-        }
-        GstContext *context = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
-        gst_context_set_gl_display(context, display);
-        gst_element_set_context(GST_ELEMENT(GST_MESSAGE_SRC(msg)), context);
-        gst_context_unref(context);
-        return GST_BUS_DROP;
-    }
-
-    if (g_strcmp0(context_type, "gst.gl.app_context") == 0) {
-        GstGLContext *gl_context = get_shared_gl_context(player->flutterpi);
-        if (gl_context == NULL) {
-            return GST_BUS_PASS;
-        }
-        GstContext *context = gst_context_new("gst.gl.app_context", TRUE);
-        gst_structure_set(gst_context_writable_structure(context), "context", GST_TYPE_GL_CONTEXT, gl_context, NULL);
-        gst_element_set_context(GST_ELEMENT(GST_MESSAGE_SRC(msg)), context);
-        gst_context_unref(context);
-        return GST_BUS_DROP;
-    }
-
-    return GST_BUS_PASS;
-}
-
-/// THROWAWAY Phase-0 spike: prove two concurrent wpevideosrc coexist. Runs once,
-/// only when FLUTTERPI_WPE_SPIKE="url1;url2" is set. Keeps both pipelines alive
-/// for the process lifetime (no teardown — that's the whole point). Remove after
-/// Phase 0. The stubs are process-lifetime so the sync handler's player->flutterpi
-/// read stays valid.
-static struct gstplayer wpe_spike_stubs[2];
-
-static void wpe_spike_run(struct flutterpi *flutterpi) {
-    const char *spec = getenv("FLUTTERPI_WPE_SPIKE");
-    if (spec == NULL) {
-        return;
-    }
-
-    char *dup = strdup(spec);
-    char *sep = strchr(dup, ';');
-    if (sep == NULL) {
-        LOG_ERROR("FLUTTERPI_WPE_SPIKE needs 'url1;url2'\n");
-        free(dup);
-        return;
-    }
-    *sep = '\0';
-    const char *urls[2] = { dup, sep + 1 };
-
-    for (int i = 0; i < 2; i++) {
-        char desc[1024];
-        snprintf(
-            desc,
-            sizeof desc,
-            "wpevideosrc name=websrc location=%s draw-background=false ! videoconvert ! fakesink sync=false",
-            urls[i]
-        );
-
-        GError *err = NULL;
-        GstElement *pipeline = gst_parse_launch(desc, &err);
-        if (pipeline == NULL) {
-            LOG_ERROR("WPE_SPIKE pipeline %d parse failed: %s\n", i, err != NULL ? err->message : "?");
-            if (err != NULL) {
-                g_error_free(err);
-            }
-            continue;
-        }
-
-        wpe_spike_stubs[i].flutterpi = flutterpi;
-
-        GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-        gst_bus_set_sync_handler(bus, on_bus_sync_message, &wpe_spike_stubs[i], NULL);
-
-        GstGLDisplay *display = get_shared_gl_display(flutterpi);
-        if (display != NULL) {
-            GstContext *c = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
-            gst_context_set_gl_display(c, display);
-            gst_element_set_context(pipeline, c);
-            gst_context_unref(c);
-        }
-
-        GstGLContext *gl_context = get_shared_gl_context(flutterpi);
-        if (gl_context != NULL) {
-            GstContext *c = gst_context_new("gst.gl.app_context", TRUE);
-            gst_structure_set(gst_context_writable_structure(c), "context", GST_TYPE_GL_CONTEXT, gl_context, NULL);
-            gst_element_set_context(pipeline, c);
-            gst_context_unref(c);
-        }
-        gst_object_unref(bus);
-
-        GstStateChangeReturn r = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-        LOG_ERROR("WPE_SPIKE pipeline %d (%s) set_state PLAYING = %d\n", i, urls[i], (int) r);
-        // Intentionally keep pipeline (and dup, referenced by location) alive for
-        // the process lifetime. No teardown.
-    }
-}
-#endif
-
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
@@ -1233,33 +1033,6 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
 
-#ifdef HAVE_GSTREAMER_GL
-    // Provide the shared GstGLDisplay two ways: proactively on the pipeline
-    // (present before wpevideosrc first probes) and via a sync handler (answers
-    // a NEED_CONTEXT synchronously, before the element self-provisions its own
-    // display). Both are needed so multiple WPE webviews share one EGL display.
-    GstGLDisplay *gl_display = get_shared_gl_display(player->flutterpi);
-    if (gl_display != NULL) {
-        GstContext *gl_context = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
-        gst_context_set_gl_display(gl_context, gl_display);
-        gst_element_set_context(pipeline, gl_context);
-        gst_context_unref(gl_context);
-    }
-
-    // Also proactively provide the wrapped app GstGLContext so gstwpe's internal
-    // context is created sharing GL objects with flutter-pi (and so multiple
-    // wpevideosrc agree on one context).
-    GstGLContext *gl_app_context = get_shared_gl_context(player->flutterpi);
-    if (gl_app_context != NULL) {
-        GstContext *app_ctx = gst_context_new("gst.gl.app_context", TRUE);
-        gst_structure_set(gst_context_writable_structure(app_ctx), "context", GST_TYPE_GL_CONTEXT, gl_app_context, NULL);
-        gst_element_set_context(pipeline, app_ctx);
-        gst_context_unref(app_ctx);
-    }
-
-    gst_bus_set_sync_handler(bus, on_bus_sync_message, player, NULL);
-#endif
-
     gst_bus_get_pollfd(bus, &fd);
 
     flutterpi_sd_event_add_io(&busfd_event_source, fd.fd, EPOLLIN, on_bus_fd_ready, player);
@@ -1336,15 +1109,6 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
 
     ASSERT_NOT_NULL(flutterpi);
     assert((uri != NULL) != (pipeline_descr != NULL));
-
-#ifdef HAVE_GSTREAMER_GL
-    // THROWAWAY Phase-0 spike hook: fires once, only when FLUTTERPI_WPE_SPIKE is set.
-    static gsize wpe_spike_once = 0;
-    if (g_once_init_enter(&wpe_spike_once)) {
-        wpe_spike_run(flutterpi);
-        g_once_init_leave(&wpe_spike_once, 1);
-    }
-#endif
 
     player = malloc(sizeof *player);
     if (player == NULL)
