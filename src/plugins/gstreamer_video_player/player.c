@@ -910,7 +910,11 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     GError *error = NULL;
     int ok;
 
-    static const char *default_pipeline_descr = "uridecodebin name=\"src\" ! video/x-raw ! appsink sync=true name=\"sink\"";
+    // Video -> appsink (texture); audio -> system sink. Without the audio
+    // branch, uridecodebin decodes audio and drops it (silent DLNA/Plex casts).
+    static const char *default_pipeline_descr =
+        "uridecodebin name=\"src\" ! video/x-raw ! appsink sync=true name=\"sink\" "
+        "src. ! audioconvert ! audioresample ! autoaudiosink";
 
     const char *pipeline_descr;
     if (player->pipeline_description != NULL) {
