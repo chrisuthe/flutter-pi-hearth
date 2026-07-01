@@ -26,7 +26,7 @@ The fix belongs in the embedder: share **one** `GstGLDisplay` across every
 
 ## Goals
 
-1. **Lift the cap.** 2–3 warm WPE WebViews coexist without SIGSEGV; instant
+1. **Lift the cap.** N warm WPE WebViews coexist without SIGSEGV; instant
    (warm) switching restored. This lets Hearth revert PR #170's 1-session cap.
 2. **Zero-copy frames.** Remove the per-frame GPU→CPU→GPU round-trip that the
    current `... ! videoconvert ! appsink` path incurs, by delivering `GLMemory`
