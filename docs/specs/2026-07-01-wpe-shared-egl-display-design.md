@@ -2,8 +2,8 @@
 
 - **Date:** 2026-07-01
 - **Repo:** flutter-pi-hearth (embedder / native side)
-- **Status:** Design approved, pending implementation plan
-- **Related:** Hearth PR #170 (Dart-side workaround this replaces)
+- **Status:** Implemented and REVERTED — on-Pi validation showed sharing the `GstGLDisplay` alone is insufficient (it eliminates the "Multiple EGL displays" error but exposes an upstream WPEBackend-fdo teardown use-after-free in `wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image`). Superseded by `2026-07-01-wpe-warm-webview-tabs-design.md`, which reframes the fix around keeping views alive (no per-switch teardown) plus shared display **and** context.
+- **Related:** Hearth PR #170 (Dart-side workaround); `2026-07-01-wpe-warm-webview-tabs-design.md` (successor)
 
 ## Problem
 
